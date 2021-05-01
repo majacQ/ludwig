@@ -19,17 +19,22 @@
 # email: ivaylo.stefanov82@gmail.com
 # github: https://github.com/istefano82
 # ==============================================================================
-
 import glob
 import json
+import logging
 import os
 import shutil
 import subprocess
-
+import tempfile
 import numpy as np
+import pandas as pd
 
-from ludwig.experiment import experiment
-from ludwig.utils.data_utils import load_from_file, load_json
+from ludwig.constants import *
+from ludwig.api import LudwigModel
+from ludwig.experiment import experiment_cli
+from ludwig.utils.data_utils import get_split_path, split_dataset_ttv
+from ludwig.visualize import _extract_ground_truth_values, \
+    compare_classifiers_performance_from_prob
 from tests.integration_tests.test_visualization_api import obtain_df_splits
 from tests.integration_tests.utils import generate_data
 from tests.integration_tests.utils import text_feature, category_feature, \
@@ -47,11 +52,11 @@ def run_experiment(input_features, output_features, **kwargs):
     arguments
     :return: None
     """
-    model_definition = None
+    config = None
     if input_features is not None and output_features is not None:
         # This if is necessary so that the caller can call with
-        # model_definition_file (and not model_definition)
-        model_definition = {
+        # config_file (and not config)
+        config = {
             'input_features': input_features,
             'output_features': output_features,
             'combiner': {
@@ -62,16 +67,17 @@ def run_experiment(input_features, output_features, **kwargs):
         }
 
     args = {
-        'model_definition': model_definition,
+        'config': config,
         'skip_save_processed_input': False,
         'skip_save_progress': False,
         'skip_save_unprocessed_output': False,
+        'skip_save_eval_stats': False,
     }
     args.update(kwargs)
 
-    exp_dir_name = experiment(**args)
+    _, _, _, _, output_dir = experiment_cli(**args)
 
-    return exp_dir_name
+    return output_dir
 
 
 def get_output_feature_name(experiment_dir, output_feature=0):
@@ -82,11 +88,11 @@ def get_output_feature_name(experiment_dir, output_feature=0):
     :return output_feature_name: name of the first output feature name
                         from the experiment
     """
-    description_file = experiment_dir + '/description.json'
+    description_file = os.path.join(experiment_dir, 'description.json')
     with open(description_file, 'rb') as f:
         content = json.load(f)
     output_feature_name = \
-        content['model_definition']['output_features'][output_feature]['name']
+        content['config']['output_features'][output_feature]['name']
     return output_feature_name
 
 
@@ -105,12 +111,12 @@ def test_visualization_learning_curves_output_saved(csv_filename):
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
 
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
-    train_stats = exp_dir_name + '/training_statistics.json'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
+    train_stats = os.path.join(exp_dir_name, 'training_statistics.json')
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -133,7 +139,7 @@ def test_visualization_learning_curves_output_saved(csv_filename):
         figure_cnt = glob.glob(viz_pattern)
 
         assert 0 == result.returncode
-        assert 5 == len(figure_cnt)
+        assert 4 == len(figure_cnt)
 
     shutil.rmtree(exp_dir_name, ignore_errors=True)
 
@@ -153,13 +159,13 @@ def test_visualization_confusion_matrix_output_saved(csv_filename):
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth_metadata = experiment_source_data_name + '.json'
-    test_stats = exp_dir_name + '/test_statistics.json'
+    ground_truth_metadata = experiment_source_data_name + '.meta.json'
+    test_stats = os.path.join(exp_dir_name, 'test_statistics.json')
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -208,12 +214,12 @@ def test_visualization_compare_performance_output_saved(csv_filename):
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     experiment_source_data_name = csv_filename.split('.')[0]
-    test_stats = exp_dir_name + '/test_statistics.json'
+    test_stats = os.path.join(exp_dir_name, 'test_statistics.json')
 
     test_cmd_pdf = ['python',
                     '-m',
@@ -241,7 +247,7 @@ def test_visualization_compare_performance_output_saved(csv_filename):
         figure_cnt = glob.glob(viz_pattern)
 
         assert 0 == result.returncode
-        assert 2 == len(figure_cnt)
+        assert 1 == len(figure_cnt)
 
     shutil.rmtree(exp_dir_name, ignore_errors=True)
     shutil.rmtree('results', ignore_errors=True)
@@ -250,6 +256,7 @@ def test_visualization_compare_performance_output_saved(csv_filename):
             os.remove(file)
         except OSError as e:  # if failed, report it back to the user
             print("Error: %s - %s." % (e.filename, e.strerror))
+
 
 def test_visualization_compare_classifiers_from_prob_csv_output_saved(
         csv_filename
@@ -261,26 +268,26 @@ def test_visualization_compare_classifiers_from_prob_csv_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
 
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.csv'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.csv').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = get_split_path(csv_filename)
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -290,6 +297,10 @@ def test_visualization_compare_classifiers_from_prob_csv_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -328,26 +339,26 @@ def test_visualization_compare_classifiers_from_prob_npy_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
 
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -357,6 +368,10 @@ def test_visualization_compare_classifiers_from_prob_npy_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -384,6 +399,7 @@ def test_visualization_compare_classifiers_from_prob_npy_output_saved(
         except OSError as e:  # if failed, report it back to the user
             print("Error: %s - %s." % (e.filename, e.strerror))
 
+
 def test_visualization_compare_classifiers_from_pred_npy_output_saved(
         csv_filename
 ):
@@ -394,26 +410,26 @@ def test_visualization_compare_classifiers_from_pred_npy_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    prediction = exp_dir_name + '/{}_predictions.npy'.format(output_feature_name)
+    prediction = os.path.join(exp_dir_name, '{}_predictions.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
+    ground_truth_metadata = experiment_source_data_name + '.meta.json'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -425,6 +441,8 @@ def test_visualization_compare_classifiers_from_pred_npy_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
                     '--predictions',
                     prediction,
                     prediction,
@@ -452,6 +470,7 @@ def test_visualization_compare_classifiers_from_pred_npy_output_saved(
         except OSError as e:  # if failed, report it back to the user
             print("Error: %s - %s." % (e.filename, e.strerror))
 
+
 def test_visualization_compare_classifiers_from_pred_csv_output_saved(
         csv_filename
 ):
@@ -462,26 +481,26 @@ def test_visualization_compare_classifiers_from_pred_csv_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    prediction = exp_dir_name + '/{}_predictions.csv'.format(output_feature_name)
+    prediction = os.path.join(exp_dir_name, '{}_predictions.csv').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
+    ground_truth_metadata = experiment_source_data_name + '.meta.json'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -493,6 +512,8 @@ def test_visualization_compare_classifiers_from_pred_csv_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
                     '--predictions',
                     prediction,
                     prediction,
@@ -528,25 +549,25 @@ def test_visualization_compare_classifiers_subset_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -554,6 +575,10 @@ def test_visualization_compare_classifiers_subset_output_saved(csv_filename):
                     'compare_classifiers_performance_subset',
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -591,25 +616,26 @@ def test_visualization_compare_classifiers_changing_k_output_pdf(csv_filename):
 
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
+    ground_truth_metadata = exp_dir_name + '/model/training_set_metadata.json'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -617,6 +643,10 @@ def test_visualization_compare_classifiers_changing_k_output_pdf(csv_filename):
                     'compare_classifiers_performance_changing_k',
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    ground_truth_metadata,
                     '--probabilities',
                     probability,
                     probability,
@@ -657,25 +687,23 @@ def test_visualization_compare_classifiers_multiclass_multimetric_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    test_stats = exp_dir_name + '/test_statistics.json'
+    test_stats = os.path.join(exp_dir_name, 'test_statistics.json')
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth_metadata = experiment_source_data_name + '.meta.json'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -720,25 +748,25 @@ def test_visualization_compare_classifiers_predictions_npy_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    prediction = exp_dir_name + '/{}_predictions.npy'.format(output_feature_name)
+    prediction = os.path.join(exp_dir_name, '{}_predictions.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -748,6 +776,10 @@ def test_visualization_compare_classifiers_predictions_npy_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--predictions',
                     prediction,
                     prediction,
@@ -786,25 +818,25 @@ def test_visualization_compare_classifiers_predictions_csv_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    prediction = exp_dir_name + '/{}_predictions.csv'.format(output_feature_name)
+    prediction = os.path.join(exp_dir_name, '{}_predictions.csv').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -814,6 +846,10 @@ def test_visualization_compare_classifiers_predictions_csv_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--predictions',
                     prediction,
                     prediction,
@@ -841,6 +877,7 @@ def test_visualization_compare_classifiers_predictions_csv_output_saved(
         except OSError as e:  # if failed, report it back to the user
             print("Error: %s - %s." % (e.filename, e.strerror))
 
+
 def test_visualization_cmp_classifiers_predictions_distribution_output_saved(
         csv_filename
 ):
@@ -850,25 +887,25 @@ def test_visualization_cmp_classifiers_predictions_distribution_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    prediction = exp_dir_name + '/{}_predictions.npy'.format(output_feature_name)
+    prediction = os.path.join(exp_dir_name, '{}_predictions.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -878,6 +915,10 @@ def test_visualization_cmp_classifiers_predictions_distribution_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--predictions',
                     prediction,
                     prediction,
@@ -913,25 +954,25 @@ def test_visualization_cconfidence_thresholding_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -941,6 +982,10 @@ def test_visualization_cconfidence_thresholding_output_saved(csv_filename):
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -978,25 +1023,25 @@ def test_visualization_confidence_thresholding_data_vs_acc_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1006,6 +1051,10 @@ def test_visualization_confidence_thresholding_data_vs_acc_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1043,25 +1092,25 @@ def test_visualization_confidence_thresholding_data_vs_acc_subset_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1071,6 +1120,10 @@ def test_visualization_confidence_thresholding_data_vs_acc_subset_output_saved(
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1110,26 +1163,25 @@ def test_vis_confidence_thresholding_data_vs_acc_subset_per_class_output_saved(
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=5, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1137,10 +1189,12 @@ def test_vis_confidence_thresholding_data_vs_acc_subset_per_class_output_saved(
                     'confidence_thresholding_data_vs_acc_subset_per_class',
                     '--ground_truth',
                     ground_truth,
-                    '--ground_truth_metadata',
-                    ground_truth_metadata,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1198,20 +1252,22 @@ def test_vis_confidence_thresholding_2thresholds_2d_output_saved(
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     treshhold_output_feature_name1 = get_output_feature_name(exp_dir_name)
-    treshhold_output_feature_name2 = get_output_feature_name(exp_dir_name, output_feature=1)
-    probability1 = exp_dir_name + '/{}_probabilities.npy'.format(
+    treshhold_output_feature_name2 = get_output_feature_name(exp_dir_name,
+                                                             output_feature=1)
+    probability1 = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
         treshhold_output_feature_name1
     )
-    probability2 = exp_dir_name + '/{}_probabilities.npy'.format(
+    probability2 = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
         treshhold_output_feature_name2
     )
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1219,6 +1275,10 @@ def test_vis_confidence_thresholding_2thresholds_2d_output_saved(
                     'confidence_thresholding_2thresholds_2d',
                     '--ground_truth',
                     ground_truth,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability1,
                     probability2,
@@ -1274,20 +1334,22 @@ def test_vis_confidence_thresholding_2thresholds_3d_output_saved(csv_filename):
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     treshhold_output_feature_name1 = get_output_feature_name(exp_dir_name)
-    treshhold_output_feature_name2 = get_output_feature_name(exp_dir_name, output_feature=1)
-    probability1 = exp_dir_name + '/{}_probabilities.npy'.format(
+    treshhold_output_feature_name2 = get_output_feature_name(exp_dir_name,
+                                                             output_feature=1)
+    probability1 = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
         treshhold_output_feature_name1
     )
-    probability2 = exp_dir_name + '/{}_probabilities.npy'.format(
+    probability2 = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
         treshhold_output_feature_name2
     )
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1295,6 +1357,10 @@ def test_vis_confidence_thresholding_2thresholds_3d_output_saved(csv_filename):
                     'confidence_thresholding_2thresholds_3d',
                     '--ground_truth',
                     ground_truth,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability1,
                     probability2,
@@ -1348,14 +1414,16 @@ def test_visualization_binary_threshold_vs_metric_output_saved(csv_filename):
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1369,6 +1437,10 @@ def test_visualization_binary_threshold_vs_metric_output_saved(csv_filename):
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1404,26 +1476,25 @@ def test_visualization_roc_curves_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1435,10 +1506,12 @@ def test_visualization_roc_curves_output_saved(csv_filename):
                     'accuracy',
                     '--ground_truth',
                     ground_truth,
-                    '--ground_truth_metadata',
-                    ground_truth_metadata,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1479,16 +1552,16 @@ def test_visualization_roc_curves_from_test_statistics_output_saved(
     output_features = [binary_feature()]
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
+
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    test_stats = exp_dir_name + '/test_statistics.json'
+    test_stats = os.path.join(exp_dir_name, 'test_statistics.json')
     experiment_source_data_name = csv_filename.split('.')[0]
     test_cmd_pdf = ['python',
                     '-m',
@@ -1530,25 +1603,25 @@ def test_visualization_calibration_1_vs_all_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1560,6 +1633,10 @@ def test_visualization_calibration_1_vs_all_output_saved(csv_filename):
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1579,7 +1656,7 @@ def test_visualization_calibration_1_vs_all_output_saved(csv_filename):
         figure_cnt = glob.glob(viz_pattern)
 
         assert 0 == result.returncode
-        assert 5 == len(figure_cnt)
+        assert 7 == len(figure_cnt)
 
     shutil.rmtree(exp_dir_name, ignore_errors=True)
     shutil.rmtree('results', ignore_errors=True)
@@ -1597,25 +1674,25 @@ def test_visualization_calibration_multiclass_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    probability = exp_dir_name + '/{}_probabilities.npy'.format(output_feature_name)
+    probability = os.path.join(exp_dir_name, '{}_probabilities.npy').format(
+        output_feature_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1625,6 +1702,10 @@ def test_visualization_calibration_multiclass_output_saved(csv_filename):
                     ground_truth,
                     '--output_feature_name',
                     output_feature_name,
+                    '--split_file',
+                    split_file,
+                    '--ground_truth_metadata',
+                    exp_dir_name + '/model/training_set_metadata.json',
                     '--probabilities',
                     probability,
                     probability,
@@ -1660,25 +1741,23 @@ def test_visualization_frequency_vs_f1_output_saved(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
-    vis_output_pattern_pdf = exp_dir_name + '/*.pdf'
-    vis_output_pattern_png = exp_dir_name + '/*.png'
+    vis_output_pattern_pdf = os.path.join(exp_dir_name, '*.pdf')
+    vis_output_pattern_png = os.path.join(exp_dir_name, '*.png')
     output_feature_name = get_output_feature_name(exp_dir_name)
-    test_stats = exp_dir_name + '/test_statistics.json'
+    test_stats = os.path.join(exp_dir_name, 'test_statistics.json')
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth_metadata = experiment_source_data_name + '.json'
+    ground_truth_metadata = experiment_source_data_name + '.meta.json'
     test_cmd_pdf = ['python',
                     '-m',
                     'ludwig.visualize',
@@ -1715,6 +1794,7 @@ def test_visualization_frequency_vs_f1_output_saved(csv_filename):
         except OSError as e:  # if failed, report it back to the user
             print("Error: %s - %s." % (e.filename, e.strerror))
 
+
 def test_load_ground_truth_split_from_file(csv_filename):
     """Ensure correct ground truth split is loaded when ground_truth_split is given.
 
@@ -1722,48 +1802,50 @@ def test_load_ground_truth_split_from_file(csv_filename):
     :return: None
     """
     input_features = [
-        text_feature(vocab_size=10, min_len=1, representation='sparse'),
         category_feature(vocab_size=10)
     ]
     output_features = [category_feature(vocab_size=2, reduce_input='sum')]
 
     # Generate test data
     rel_path = generate_data(input_features, output_features, csv_filename)
-    input_features[0]['encoder'] = 'parallel_cnn'
     exp_dir_name = run_experiment(
         input_features,
         output_features,
-        data_csv=rel_path
+        dataset=rel_path
     )
     output_feature_name = get_output_feature_name(exp_dir_name)
     experiment_source_data_name = csv_filename.split('.')[0]
-    ground_truth = experiment_source_data_name + '.hdf5'
+    ground_truth = experiment_source_data_name + '.csv'
+    split_file = experiment_source_data_name + '.split.csv'
 
-    ground_truth_train_split = load_from_file(ground_truth, output_feature_name,
-                                              ground_truth_split=0)
-    ground_truth_val_split = load_from_file(ground_truth, output_feature_name,
-                                              ground_truth_split=1)
-    ground_truth_test_split = load_from_file(ground_truth, output_feature_name)
+    # retrieve ground truth from source data set
+    ground_truth_train_split = _extract_ground_truth_values(
+        ground_truth,
+        output_feature_name,
+        0,
+        split_file
+    )
+    ground_truth_val_split = _extract_ground_truth_values(
+        ground_truth,
+        output_feature_name,
+        1,
+        split_file
+    )
+    ground_truth_test_split = _extract_ground_truth_values(
+        ground_truth,
+        output_feature_name,
+        2,
+        split_file
+    )
 
     test_df, train_df, val_df = obtain_df_splits(csv_filename)
     target_predictions_from_train = train_df[output_feature_name]
     target_predictions_from_val = val_df[output_feature_name]
     target_predictions_from_test = test_df[output_feature_name]
-    gtm_name = experiment_source_data_name + '.json'
-    ground_truth_metadata = load_json(gtm_name)
-    ground_truth_loaded_train_split = np.asarray([
-        ground_truth_metadata[output_feature_name]['str2idx'][train_row]
-        for train_row in target_predictions_from_train
-    ])
-    ground_truth_loaded_val_split = np.asarray([
-        ground_truth_metadata[output_feature_name]['str2idx'][val_row]
-        for val_row in target_predictions_from_val
-    ])
-    ground_truth_loaded_test_split = np.asarray([
-        ground_truth_metadata[output_feature_name]['str2idx'][test_row]
-        for test_row in target_predictions_from_test
-    ])
 
-    assert str(ground_truth_train_split) == str(ground_truth_loaded_train_split)
-    assert str(ground_truth_val_split) == str(ground_truth_loaded_val_split)
-    assert str(ground_truth_test_split) == str(ground_truth_loaded_test_split)
+    assert str(ground_truth_train_split.values) == \
+           str(target_predictions_from_train.values)
+    assert str(ground_truth_val_split.values) == \
+           str(target_predictions_from_val.values)
+    assert str(ground_truth_test_split.values) == \
+           str(target_predictions_from_test.values)

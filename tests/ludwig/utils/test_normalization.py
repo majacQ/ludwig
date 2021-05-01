@@ -13,13 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from ludwig.features.numerical_feature import NumericalBaseFeature
+from ludwig.constants import PROC_COLUMN, COLUMN, NAME
+from ludwig.features.feature_utils import compute_feature_hash
+from ludwig.features.numerical_feature import NumericalFeatureMixin
+
 
 def numerical_feature():
-    return {'name': 'x' , 'type': 'numerical'}
+    feature = {NAME: 'x', COLUMN: 'x', 'type': 'numerical'}
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
+
 
 data_df = pd.DataFrame(pd.Series([
     2,
@@ -29,49 +35,43 @@ data_df = pd.DataFrame(pd.Series([
     10
 ]), columns=['x'])
 
-data = pd.DataFrame(pd.Series([
-    2,
-    4,
-    6,
-    8,
-    10
-]), columns=['x'])
+data = pd.DataFrame(columns=['x'])
 
-feature_1 = NumericalBaseFeature(numerical_feature())
-feature_2 = NumericalBaseFeature(numerical_feature())
 
 def test_norm():
-    feature_1_meta = feature_1.get_feature_meta(
+    feature_1_meta = NumericalFeatureMixin.get_feature_meta(
         data_df['x'], {'normalization': 'zscore'}
     )
-    feature_2_meta = feature_1.get_feature_meta(
+    feature_2_meta = NumericalFeatureMixin.get_feature_meta(
         data_df['x'], {'normalization': 'minmax'}
     )
-    
+
     assert feature_1_meta['mean'] == 6
     assert feature_2_meta['min'] == 2
     assert feature_2_meta['max'] == 10
-    
+
     # value checks after normalization
-    feature_1.add_feature_data(
-        feature=numerical_feature(),
+    num_feature = numerical_feature()
+
+    NumericalFeatureMixin.add_feature_data(
+        feature=num_feature,
         dataset_df=data_df,
-        data=data,
-        metadata={'x': feature_1_meta},
+        dataset=data,
+        metadata={num_feature[NAME]: feature_1_meta},
         preprocessing_parameters={'normalization': 'zscore'}
     )
-    assert np.allclose(np.array(data['x']), 
-        np.array([-1.26491106, -0.63245553,  0,  0.63245553,  1.26491106])
-    )
+    assert np.allclose(np.array(data[num_feature[PROC_COLUMN]]),
+                       np.array([-1.26491106, -0.63245553, 0, 0.63245553,
+                                 1.26491106])
+                       )
 
-    feature_2.add_feature_data(
-        feature=numerical_feature(),
+    NumericalFeatureMixin.add_feature_data(
+        feature=num_feature,
         dataset_df=data_df,
-        data=data,
-        metadata={'x': feature_2_meta},
+        dataset=data,
+        metadata={num_feature[NAME]: feature_2_meta},
         preprocessing_parameters={'normalization': 'minmax'}
     )
-    assert np.allclose(np.array(data['x']), 
-        np.array([0, 0.25, 0.5 , 0.75, 1])
-    )
-
+    assert np.allclose(np.array(data[num_feature[PROC_COLUMN]]),
+                       np.array([0, 0.25, 0.5, 0.75, 1])
+                       )

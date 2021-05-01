@@ -45,6 +45,17 @@ def convert_size(size_bytes):
     return '{} {}'.format(s, size_name[i])
 
 
+def exponential_decay(initial_learning_rate, decay_rate, decay_steps, step,
+                      staircase=False):
+    decay_rate = float(decay_rate)
+    decay_steps = float(decay_steps)
+    step = float(step)
+    exponent = step / decay_steps
+    if staircase:
+        exponent = math.ceil(exponent)
+    return initial_learning_rate * math.pow(decay_rate, exponent)
+
+
 def learning_rate_warmup_distributed(
         learning_rate,
         epoch,
@@ -61,7 +72,7 @@ def learning_rate_warmup_distributed(
      See https://arxiv.org/pdf/1706.02677.pdf for details.
 
      Inspired by Horovod's implementation:
-     https://github.com/uber/horovod/blob/master/horovod/keras/callbacks.py#L202
+     https://horovod.readthedocs.io/en/stable/api.html#horovod.tensorflow.keras.callbacks.LearningRateWarmupCallback
      Math recap:
                                                    curr_step
             epoch               = full_epochs + ---------------
@@ -74,12 +85,12 @@ def learning_rate_warmup_distributed(
                                   size
             lr'(epoch = warmup) = lr
     """
-    if epoch > warmup_epochs:
+    if epoch >= warmup_epochs:
         return learning_rate
     else:
         epoch_adjusted = float(epoch) + (curr_step / steps_per_epoch)
-        return learning_rate / num_workers * \
-               (epoch_adjusted * (num_workers - 1) / warmup_epochs + 1)
+        return learning_rate / num_workers * (
+                epoch_adjusted * (num_workers - 1) / warmup_epochs + 1)
 
 
 def learning_rate_warmup(
@@ -89,16 +100,30 @@ def learning_rate_warmup(
         curr_step,
         steps_per_epoch
 ):
-    global_curr_step = 1 + curr_step + epoch * steps_per_epoch
-    warmup_steps = warmup_epochs * steps_per_epoch
+    if epoch >= warmup_epochs:
+        return learning_rate
+    else:
+        global_curr_step = 1 + curr_step + epoch * steps_per_epoch
+        warmup_steps = warmup_epochs * steps_per_epoch
 
-    warmup_percent_done = global_curr_step / warmup_steps
-    warmup_learning_rate = learning_rate * warmup_percent_done
+        warmup_percent_done = global_curr_step / warmup_steps
+        warmup_learning_rate = learning_rate * warmup_percent_done
 
-    is_warmup = int(global_curr_step < warmup_steps)
-    interpolated_learning_rate = (
-            (1.0 - is_warmup) * learning_rate +
-            is_warmup * warmup_learning_rate
-    )
+        is_warmup = int(global_curr_step < warmup_steps)
+        interpolated_learning_rate = (
+                (1.0 - is_warmup) * learning_rate +
+                is_warmup * warmup_learning_rate
+        )
 
-    return interpolated_learning_rate
+        return interpolated_learning_rate
+
+
+def round2precision(val, precision: int = 0, which: str = ''):
+    assert precision >= 0
+    val *= 10 ** precision
+    round_callback = round
+    if which.lower() == 'up':
+        round_callback = math.ceil
+    if which.lower() == 'down':
+        round_callback = math.floor
+    return '{1:.{0}f}'.format(precision, round_callback(val) / 10 ** precision)

@@ -13,20 +13,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
+import multiprocessing
+import os
 import random
+import shutil
+import sys
+import traceback
+import unittest
 import uuid
+from distutils.util import strtobool
 
+import cloudpickle
 import pandas as pd
 
-from ludwig.data.dataset_synthesyzer import DATETIME_FORMATS
-from ludwig.data.dataset_synthesyzer import build_synthetic_dataset
-from ludwig.constants import VECTOR
+from ludwig.constants import VECTOR, COLUMN, NAME, PROC_COLUMN
+from ludwig.data.dataset_synthesizer import DATETIME_FORMATS
+from ludwig.data.dataset_synthesizer import build_synthetic_dataset
+from ludwig.experiment import experiment_cli
+from ludwig.features.feature_utils import compute_feature_hash
 
 ENCODERS = [
     'embed', 'rnn', 'parallel_cnn', 'cnnrnn', 'stacked_parallel_cnn',
-    'stacked_cnn'
+    'stacked_cnn', 'transformer'
 ]
+
+HF_ENCODERS_SHORT = ['distilbert']
+
+HF_ENCODERS = [
+    'bert',
+    'gpt',
+    'gpt2',
+    # 'transformer_xl',
+    'xlnet',
+    'xlm',
+    'roberta',
+    'distilbert',
+    'ctrl',
+    'camembert',
+    'albert',
+    't5',
+    'xlmroberta',
+    'longformer',
+    'flaubert',
+    'electra',
+]
+
+
+def parse_flag_from_env(key, default=False):
+    try:
+        value = os.environ[key]
+    except KeyError:
+        # KEY isn't set, default to `default`.
+        _value = default
+    else:
+        # KEY is set, convert it to True or False.
+        try:
+            _value = strtobool(value)
+        except ValueError:
+            # More values are supported, but let's keep the message simple.
+            raise ValueError("If set, {} must be yes or no.".format(key))
+    return _value
+
+
+_run_slow_tests = parse_flag_from_env("RUN_SLOW", default=False)
+
+
+def slow(test_case):
+    """
+    Decorator marking a test as slow.
+
+    Slow tests are skipped by default. Set the RUN_SLOW environment variable
+    to a truth value to run them.
+
+    """
+    if not _run_slow_tests:
+        test_case = unittest.skip("Skipping: this test is too slow")(test_case)
+    return test_case
 
 
 def generate_data(
@@ -58,33 +120,38 @@ def random_string(length=5):
     return uuid.uuid4().hex[:length].upper()
 
 
-def numerical_feature(normalization=None):
-    return {
+def numerical_feature(normalization=None, **kwargs):
+    feature = {
         'name': 'num_' + random_string(),
         'type': 'numerical',
         'preprocessing': {
             'normalization': normalization
         }
     }
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
 def category_feature(**kwargs):
-    cat_feature = {
+    feature = {
         'type': 'category',
         'name': 'category_' + random_string(),
         'vocab_size': 10,
         'embedding_size': 5
     }
-
-    cat_feature.update(kwargs)
-    return cat_feature
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
 def text_feature(**kwargs):
     feature = {
         'name': 'text_' + random_string(),
         'type': 'text',
-        'reduce_input': 'null',
+        'reduce_input': None,
         'vocab_size': 5,
         'min_len': 7,
         'max_len': 7,
@@ -92,6 +159,8 @@ def text_feature(**kwargs):
         'state_size': 8
     }
     feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
@@ -104,11 +173,13 @@ def set_feature(**kwargs):
         'embedding_size': 5
     }
     feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
 def sequence_feature(**kwargs):
-    seq_feature = {
+    feature = {
         'type': 'sequence',
         'name': 'sequence_' + random_string(),
         'vocab_size': 10,
@@ -117,21 +188,24 @@ def sequence_feature(**kwargs):
         'embedding_size': 8,
         'fc_size': 8,
         'state_size': 8,
-        'num_filters': 8
+        'num_filters': 8,
+        'hidden_size': 8
     }
-    seq_feature.update(kwargs)
-    return seq_feature
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
 def image_feature(folder, **kwargs):
-    img_feature = {
+    feature = {
         'type': 'image',
         'name': 'image_' + random_string(),
         'encoder': 'resnet',
         'preprocessing': {
             'in_memory': True,
-            'height': 8,
-            'width': 8,
+            'height': 12,
+            'width': 12,
             'num_channels': 3
         },
         'resnet_size': 8,
@@ -139,8 +213,10 @@ def image_feature(folder, **kwargs):
         'fc_size': 8,
         'num_filters': 8
     }
-    img_feature.update(kwargs)
-    return img_feature
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
 def audio_feature(folder, **kwargs):
@@ -173,28 +249,35 @@ def audio_feature(folder, **kwargs):
             }
         ],
         'fc_size': 256,
-        'audio_dest_folder': folder
+        'destination_folder': folder
     }
     feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
-
 def timeseries_feature(**kwargs):
-    ts_feature = {
+    feature = {
         'name': 'timeseries_' + random_string(),
         'type': 'timeseries',
         'max_len': 7
     }
-    ts_feature.update(kwargs)
-    return ts_feature
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
-def binary_feature():
-    return {
+def binary_feature(**kwargs):
+    feature = {
         'name': 'binary_' + random_string(),
         'type': 'binary'
     }
+    feature.update(kwargs)
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
+    return feature
 
 
 def bag_feature(**kwargs):
@@ -206,12 +289,12 @@ def bag_feature(**kwargs):
         'embedding_size': 5
     }
     feature.update(kwargs)
-
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
 def date_feature(**kwargs):
-
     feature = {
         'name': 'date_' + random_string(),
         'type': 'date',
@@ -219,9 +302,9 @@ def date_feature(**kwargs):
             'datetime_format': random.choice(list(DATETIME_FORMATS.keys()))
         }
     }
-
     feature.update(kwargs)
-
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
@@ -231,7 +314,8 @@ def h3_feature(**kwargs):
         'type': 'h3'
     }
     feature.update(kwargs)
-
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
 
 
@@ -242,5 +326,122 @@ def vector_feature(**kwargs):
         'name': 'vector_' + random_string()
     }
     feature.update(kwargs)
-
+    feature[COLUMN] = feature[NAME]
+    feature[PROC_COLUMN] = compute_feature_hash(feature)
     return feature
+
+
+def run_experiment(
+        input_features,
+        output_features,
+        skip_save_processed_input=True,
+        **kwargs
+):
+    """
+    Helper method to avoid code repetition in running an experiment. Deletes
+    the data saved to disk after running the experiment
+    :param input_features: list of input feature dictionaries
+    :param output_features: list of output feature dictionaries
+    **kwargs you may also pass extra parameters to the experiment as keyword
+    arguments
+    :return: None
+    """
+    config = None
+    if input_features is not None and output_features is not None:
+        # This if is necessary so that the caller can call with
+        # config_file (and not config)
+        config = {
+            'input_features': input_features,
+            'output_features': output_features,
+            'combiner': {
+                'type': 'concat',
+                'fc_size': 14
+            },
+            'training': {'epochs': 2}
+        }
+
+    args = {
+        'config': config,
+        'skip_save_training_description': True,
+        'skip_save_training_statistics': True,
+        'skip_save_processed_input': skip_save_processed_input,
+        'skip_save_progress': True,
+        'skip_save_unprocessed_output': True,
+        'skip_save_model': True,
+        'skip_save_predictions': True,
+        'skip_save_eval_stats': True,
+        'skip_collect_predictions': True,
+        'skip_collect_overall_stats': True,
+        'skip_save_log': True
+    }
+    args.update(kwargs)
+
+    _, _, _, _, exp_dir_name = experiment_cli(**args)
+    shutil.rmtree(exp_dir_name, ignore_errors=True)
+
+
+def generate_output_features_with_dependencies(main_feature, dependencies):
+    # helper function to generate multiple output features specifications
+    # with dependencies, support for 'test_experiment_multiple_seq_seq` unit test
+    # Parameters:
+    # main_feature: feature identifier, valid values 'feat1', 'feat2', 'feat3'
+    # dependencies: list of dependencies for 'main_feature', do not li
+    # Example:
+    #  generate_output_features_with_dependencies('feat2', ['feat1', 'feat3'])
+
+    output_features = [
+        category_feature(vocab_size=2, reduce_input='sum'),
+        sequence_feature(vocab_size=10, max_len=5),
+        numerical_feature()
+    ]
+
+    # value portion of dictionary is a tuple: (position, feature_name)
+    #   position: location of output feature in the above output_features list
+    #   feature_name: Ludwig generated feature name
+    feature_names = {
+        'feat1': (0, output_features[0]['name']),
+        'feat2': (1, output_features[1]['name']),
+        'feat3': (2, output_features[2]['name'])
+    }
+
+    # generate list of dependencies with real feature names
+    generated_dependencies = [feature_names[feat_name][1]
+                              for feat_name in dependencies]
+
+    # specify dependencies for the main_feature
+    output_features[feature_names[main_feature][0]]['dependencies'] = \
+        generated_dependencies
+
+    return output_features
+
+
+def _subproc_wrapper(fn, queue, *args, **kwargs):
+    fn = cloudpickle.loads(fn)
+    try:
+        results = fn(*args, **kwargs)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        results = e
+    queue.put(results)
+
+
+def spawn(fn):
+    def wrapped_fn(*args, **kwargs):
+        ctx = multiprocessing.get_context('spawn')
+        queue = ctx.Queue()
+
+        p = ctx.Process(
+            target=_subproc_wrapper,
+            args=(cloudpickle.dumps(fn), queue, *args),
+            kwargs=kwargs)
+
+        p.start()
+        p.join()
+        results = queue.get()
+        if isinstance(results, Exception):
+            raise RuntimeError(
+                f'Spawned subprocess raised {type(results).__name__}, '
+                f'check log output above for stack trace.')
+        return results
+
+    return wrapped_fn
