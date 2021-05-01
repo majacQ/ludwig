@@ -302,7 +302,7 @@ def radar_chart(
 
     # Set ticks to the number of properties (in radians)
     t = np.arange(0, 2 * np.pi, 2 * np.pi / num_classes)
-    ax.set_xticks(t, [])
+    ax.set_xticks(t)
     ax.set_xticklabels(np.arange(0, num_classes))
 
     # Set yticks from 0 to 10
@@ -931,7 +931,6 @@ def brier_plot(
     plt.xlabel('class')
     plt.ylabel('brier')
 
-    x = np.array(range(brier_scores.shape[0]))
     for i in range(brier_scores.shape[1]):
         plt.plot(brier_scores[:, i],
                  label=algorithm_names[

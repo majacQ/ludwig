@@ -30,6 +30,13 @@ import pandas as pd
 from pandas.errors import ParserError
 from sklearn.model_selection import KFold
 
+try:
+    import dask.dataframe as dd
+    DASK_DF_FORMATS = {dd.core.DataFrame}
+except ImportError:
+    DASK_DF_FORMATS = set()
+    dd = None
+
 from ludwig.constants import PREPROCESSING, SPLIT, PROC_COLUMN
 from ludwig.globals import (MODEL_HYPERPARAMETERS_FILE_NAME,
                             MODEL_WEIGHTS_FILE_NAME,
@@ -42,7 +49,7 @@ DATA_PROCESSED_CACHE_DIR = 'data_processed_cache_dir'
 DATA_TRAIN_HDF5_FP = 'data_train_hdf5_fp'
 HDF5_COLUMNS_KEY = 'columns'
 DICT_FORMATS = {'dict', 'dictionary', dict}
-DATAFRAME_FORMATS = {'dataframe', 'df', pd.DataFrame}
+DATAFRAME_FORMATS = {'dataframe', 'df', pd.DataFrame} | DASK_DF_FORMATS
 CSV_FORMATS = {'csv'}
 TSV_FORMATS = {'tsv'}
 JSON_FORMATS = {'json'}
@@ -136,7 +143,12 @@ def read_jsonl(data_fp, df_lib):
 
 
 def read_excel(data_fp, df_lib):
-    return df_lib.read_excel(data_fp)
+    fp_split = os.path.splitext(data_fp)
+    if fp_split[1] == '.xls':
+        excel_engine = 'xlrd'
+    else:
+        excel_engine = 'openpyxl'
+    return df_lib.read_excel(data_fp, engine=excel_engine)
 
 
 def read_parquet(data_fp, df_lib):
@@ -522,9 +534,7 @@ def normalize_numpy(obj):
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, set):
-            return list(obj)
-        elif isinstance(obj, tuple):
+        if isinstance(obj, (set, tuple)):
             return list(obj)
         elif isinstance(obj, np.integer):
             return int(obj)
@@ -576,6 +586,8 @@ def clear_data_cache():
 def figure_data_format_dataset(dataset):
     if isinstance(dataset, pd.DataFrame):
         return pd.DataFrame
+    elif dd and isinstance(dataset, dd.core.DataFrame):
+        return dd.core.DataFrame
     elif isinstance(dataset, dict):
         return dict
     elif isinstance(dataset, str):
