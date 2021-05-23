@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 # coding=utf-8
-# Copyright (c) 2020 Uber Technologies, Inc.
+# Copyright (c) 2019 Uber Technologies, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-import contextlib
-from abc import ABC, abstractmethod
+from ludwig.data.dataset.pandas import PandasDataset
 
 
-class Dataset(ABC):
-    @abstractmethod
-    def __len__(self):
-        raise NotImplementedError()
+class PartitionedDataset(object):
+    def __init__(self, df, features, data_hdf5_fp):
+        self.df = df
+        self.features = features
+        self.data_hdf5_fp = data_hdf5_fp
 
-    @contextlib.contextmanager
-    @abstractmethod
-    def initialize_batcher(self, batch_size=128,
-                           should_shuffle=True,
-                           seed=0,
-                           ignore_last=False,
-                           horovod=None):
-        raise NotImplementedError()
+    def get(self, col):
+        return self.df[col]
+
+    def map_dataset_partitions(self, fn, meta):
+        def wrapped(partition):
+            dataset = PandasDataset(partition, self.features, self.data_hdf5_fp)
+            return fn(dataset)
+
+        return self.df.map_partitions(wrapped, meta=meta)
